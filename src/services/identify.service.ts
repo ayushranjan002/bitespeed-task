@@ -18,7 +18,8 @@ export const processIdentity = async (payload: IdentifyRequestPayload): Promise<
     throw new Error("Email or phone number must be provided to identify a contact.");
   }
 
-  const matchingContactsFromPayload = await prisma.contact.findMany({
+  // Find all contacts that directly match the incoming email or phone number
+  const TmatchingContactsFromPayload = await prisma.contact.findMany({
     where: {
       OR: whereClauseParts,
       deletedAt: null,
@@ -28,8 +29,9 @@ export const processIdentity = async (payload: IdentifyRequestPayload): Promise<
     },
   });
 
-  if (matchingContactsFromPayload.length === 0) {
-    const newPrimaryContact = await prisma.contact.create({
+  // Scenario 1: No existing contacts found by the provided email or phoneNumber
+  if (TmatchingContactsFromPayload.length === 0) {
+    const TnewPrimaryContact = await prisma.contact.create({
       data: {
         email: email,
         phoneNumber: phoneNumber,
@@ -39,190 +41,219 @@ export const processIdentity = async (payload: IdentifyRequestPayload): Promise<
 
     return {
       contact: {
-        primaryContatctId: newPrimaryContact.id,
-        emails: newPrimaryContact.email ? [newPrimaryContact.email] : [],
-        phoneNumbers: newPrimaryContact.phoneNumber ? [newPrimaryContact.phoneNumber] : [],
+        primaryContatctId: TnewPrimaryContact.id,
+        emails: TnewPrimaryContact.email ? [TnewPrimaryContact.email] : [],
+        phoneNumbers: TnewPrimaryContact.phoneNumber ? [TnewPrimaryContact.phoneNumber] : [],
         secondaryContactIds: [],
       },
     };
   }
 
-  let potentialPrimaryContacts: Contact[] = [];
-  for (const contact of matchingContactsFromPayload) {
-    if (contact.linkPrecedence === LinkPrecedence.primary) {
-      potentialPrimaryContacts.push(contact);
-    } else if (contact.linkedId) {
-      let current = contact;
-      let visited = new Set<number>();
-      while(current.linkedId && !visited.has(current.id)) {
-        visited.add(current.id);
-        const parent = await prisma.contact.findUnique({ where: { id: current.linkedId }});
-        if (parent) {
-            current = parent;
-        } else {
-            break; 
-        }
-      }
-      potentialPrimaryContacts.push(current);
+  // Scenario 2: Existing contacts found
+  // Determine all unique root primary contacts associated with the matching contacts
+  let TallAssociatedContacts: Contact[] = [...TmatchingContactsFromPayload];
+  const TrootPrimaryContactIds = new Set<number>();
+
+  for (const Tcontact of TmatchingContactsFromPayload) {
+    if (Tcontact.linkPrecedence === LinkPrecedence.primary) {
+      TrootPrimaryContactIds.add(Tcontact.id);
+    } else if (Tcontact.linkedId) {
+      TrootPrimaryContactIds.add(Tcontact.linkedId); // Add the direct primary ID
+      // To be absolutely sure, we could fetch all linked primaries recursively here if chains are deep
+      // For now, this assumes the problem's structure (secondaries link to a primary)
+      // Or, we find all contacts that link to these matching ones and then find their primaries.
     }
   }
 
-  const uniquePotentialPrimaries = potentialPrimaryContacts
-    .filter((contact, index, self) => index === self.findIndex((c) => c.id === contact.id))
-    .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
-
-  let truePrimaryContact: Contact;
-
-  if (uniquePotentialPrimaries.length > 0) {
-    truePrimaryContact = uniquePotentialPrimaries[0];
-  } else {
-    console.warn("Could not definitively determine a primary contact from linked IDs; using the oldest matched contact as a fallback. Data may need review.");
-    truePrimaryContact = matchingContactsFromPayload[0];
+  // Fetch all contacts that are either primary themselves (from the set) or are linked to one of these primaries.
+  // This helps build the complete picture of all potentially involved identity groups.
+  if (TrootPrimaryContactIds.size > 0) {
+      const TrelatedContacts = await prisma.contact.findMany({
+          where: {
+              OR: [
+                  { id: { in: Array.from(TrootPrimaryContactIds) } }, // The primaries themselves
+                  { linkedId: { in: Array.from(TrootPrimaryContactIds) } } // Secondaries of these primaries
+              ],
+              deletedAt: null
+          }
+      });
+      // Add these to our working set of all associated contacts, avoiding duplicates
+      TrelatedContacts.forEach(rc => {
+          if (!TallAssociatedContacts.find(ac => ac.id === rc.id)) {
+              TallAssociatedContacts.push(rc);
+          }
+      });
   }
 
-  // --- START: LOGIC FOR CREATING NEW SECONDARY CONTACT IF NEEDED ---
-  let newSecondaryContactCreated = false;
-  let newSecondaryContact: Contact | null = null;
 
-  // Check if the exact combination of incoming email and phone already exists for this primary group
-  // or if the incoming info is entirely new to the group.
-  const requestEmailProvided = typeof email === 'string';
-  const requestPhoneProvided = typeof phoneNumber === 'string';
+  // Identify all unique "primary" contacts from the broader set of associated contacts
+  const TdistinctPrimaryContactsInvolved = TallAssociatedContacts
+    .filter(c => c.linkPrecedence === LinkPrecedence.primary)
+    .filter((contact, index, self) => index === self.findIndex(c => c.id === contact.id)) // Unique
+    .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime()); // Oldest first
 
-  let isNewInformationPresent = false;
 
-  // Gather all current emails and phone numbers for the identified primary group
-  const currentGroupEmails = new Set<string>();
-  const currentGroupPhoneNumbers = new Set<string>();
-  const contactsForInfoCheck = await prisma.contact.findMany({ // Re-fetch to be sure, or use allContactsInGroup if comprehensive
+  let TtruePrimaryContact: Contact;
+  let TcontactsToUpdate: Contact[] = []; // Contacts that need to change their primary
+
+  if (TdistinctPrimaryContactsInvolved.length === 0 && TallAssociatedContacts.length > 0) {
+    // This means all associated contacts are secondary, but their primary wasn't fetched directly.
+    // This can happen if the initial payload only matched a secondary, and its primary wasn't in initial results.
+    // We need to find the primary for the oldest associated contact.
+    // This part needs careful re-evaluation or ensure TallAssociatedContacts includes all true primaries.
+    // For now, let's assume the previous `rootPrimaryContactIds` logic caught the relevant primaries.
+    // If not, we'd have to trace linkedId up from the oldest of `TallAssociatedContacts`.
+    // Let's simplify: if distinctPrimaryContactsInvolved is empty, means our initial logic missed something
+    // or we only found secondaries whose primaries are not in TallAssociatedContacts
+    // This should be handled by ensuring all relevant primaries are fetched.
+    // For simplicity, we'll assume `TdistinctPrimaryContactsInvolved` will have the primary.
+    // If `TmatchingContactsFromPayload` found contacts, at least one primary (or link to one) should emerge.
+    console.warn("No distinct primary contacts identified, but associated contacts exist. Review logic or data.");
+    // Fallback: pick the oldest contact overall from TallAssociatedContacts and treat it as primary or find its primary
+    TallAssociatedContacts.sort((a,b) => a.createdAt.getTime() - b.createdAt.getTime());
+    let TfallbackCandidate = TallAssociatedContacts[0];
+    if (TfallbackCandidate.linkedId) {
+        const Tparent = await prisma.contact.findUnique({where: {id: TfallbackCandidate.linkedId}});
+        TtruePrimaryContact = Tparent || TfallbackCandidate; // if parent not found, use the secondary itself
+    } else {
+        TtruePrimaryContact = TfallbackCandidate;
+    }
+  } else {
+    TtruePrimaryContact = TdistinctPrimaryContactsInvolved[0]; // The oldest primary is the true one
+
+    if (TdistinctPrimaryContactsInvolved.length > 1) {
+      // MERGE SCENARIO: More than one primary contact group is being linked.
+      // The truePrimaryContact is the oldest. All others become secondary to it.
+      for (let Ti = 1; Ti < TdistinctPrimaryContactsInvolved.length; Ti++) {
+        const TprimaryToDemote = TdistinctPrimaryContactsInvolved[Ti];
+        TcontactsToUpdate.push(TprimaryToDemote); // This primary will become secondary
+
+        // Find all secondaries of the primaryToDemote and also mark them for update
+        const TsecondariesOfDemotedPrimary = TallAssociatedContacts.filter(
+          c => c.linkedId === TprimaryToDemote.id
+        );
+        TcontactsToUpdate.push(...TsecondariesOfDemotedPrimary);
+      }
+
+      // Perform the updates in a transaction
+      if (TcontactsToUpdate.length > 0) {
+        await prisma.$transaction(
+          TcontactsToUpdate.map(contactToUpdate =>
+            prisma.contact.update({
+              where: { id: contactToUpdate.id },
+              data: {
+                linkedId: TtruePrimaryContact.id,
+                linkPrecedence: LinkPrecedence.secondary,
+                updatedAt: new Date(), // Explicitly set updatedAt
+              },
+            })
+          )
+        );
+        console.log(`Merged ${TcontactsToUpdate.length} contacts to primary ID ${TtruePrimaryContact.id}`);
+        // Refresh TallAssociatedContacts to reflect these changes for response generation
+        TallAssociatedContacts.forEach(c => {
+            if (TcontactsToUpdate.find(u => u.id === c.id)) {
+                c.linkedId = TtruePrimaryContact.id;
+                c.linkPrecedence = LinkPrecedence.secondary;
+            }
+        });
+      }
+    }
+  }
+
+
+  // --- Create new secondary contact if payload introduces new info ---
+  // This logic assumes truePrimaryContact is now correctly established.
+  let TnewSecondaryContact: Contact | null = null;
+  const TrequestEmailProvided = typeof email === 'string';
+  const TrequestPhoneProvided = typeof phoneNumber === 'string';
+
+  // Check against all current contacts in the now-unified group
+  const TcurrentGroupContactsForInfoCheck = await prisma.contact.findMany({
     where: {
         OR: [
-            { id: truePrimaryContact.id },
-            { linkedId: truePrimaryContact.id }
+            { id: TtruePrimaryContact.id },
+            { linkedId: TtruePrimaryContact.id }
         ],
         deletedAt: null
     }
   });
-  contactsForInfoCheck.forEach(c => {
-    if (c.email) currentGroupEmails.add(c.email);
-    if (c.phoneNumber) currentGroupPhoneNumbers.add(c.phoneNumber);
+
+
+  const TexactPayloadMatchExistsInGroup = TcurrentGroupContactsForInfoCheck.some(c => {
+      const TemailMatch = !TrequestEmailProvided || c.email === email;
+      const TphoneMatch = !TrequestPhoneProvided || c.phoneNumber === phoneNumber;
+      // Both must be true for an exact match of provided fields.
+      // If email is not provided in payload, emailMatch is true. Same for phone.
+      // If both provided, both must match.
+      if (TrequestEmailProvided && TrequestPhoneProvided) return c.email === email && c.phoneNumber === phoneNumber;
+      if (TrequestEmailProvided) return c.email === email;
+      if (TrequestPhoneProvided) return c.phoneNumber === phoneNumber;
+      return false; // Should not happen if controller validates payload
   });
 
 
-  // Condition 1: Is the incoming email new to the group?
-  if (requestEmailProvided && !currentGroupEmails.has(email!)) {
-    isNewInformationPresent = true;
-  }
-  // Condition 2: Is the incoming phone number new to the group?
-  if (requestPhoneProvided && !currentGroupPhoneNumbers.has(phoneNumber!)) {
-    isNewInformationPresent = true;
-  }
-  
-  // Condition 3: If both email and phone are provided in the request,
-  // does this specific *pair* already exist as a contact row for this group?
-  // This handles cases where email is known, phone is known, but not together in one row.
-  // However, the problem statement implies a new row if *either* is common but contains *new information*.
-  // The examples suggest that if (email_A, phone_A) is primary, and request is (email_B, phone_A),
-  // a new secondary (email_B, phone_A) is created. This is covered by isNewInformationPresent already.
-  // A stricter check could be:
-  // if (requestEmailProvided && requestPhoneProvided) {
-  //   const exactMatchExists = contactsForInfoCheck.some(c => c.email === email && c.phoneNumber === phoneNumber);
-  //   if (!exactMatchExists) isNewInformationPresent = true; // Or a more specific flag
-  // }
-
-  // If there's new information (new email, new phone, or a new combination of existing ones not yet a row)
-  // AND if at least one piece of info (email or phone) from the request matches *some* contact that led us to this primary.
-  // The second part is implicitly true because `matchingContactsFromPayload` was not empty.
-  
-  // Create a new secondary contact if:
-  // 1. The request contains an email not yet in the group OR
-  // 2. The request contains a phone number not yet in the group.
-  // (This simplification covers the examples where a new piece of info leads to a secondary)
-  
-  // A simpler check based on problem's example: if the incoming request's (email, phone) combo doesn't perfectly match an existing row for this group,
-  // and at least one part of it (email or phone) links to the group, create secondary.
-  // More directly: if the incoming data isn't fully redundant for this group.
-  
-  // Does the *exact* combination of (payload.email, payload.phoneNumber) exist as a row linked to this primaryContact?
-  // Let's refine `isNewInformationPresent`:
-  // We create a new secondary if the *specific combination* from the payload isn't already perfectly represented
-  // by an existing contact row within the identified group.
-  const exactPayloadMatchExistsInGroup = contactsForInfoCheck.some(c => {
-      const emailMatch = !requestEmailProvided || c.email === email; // True if request.email is null OR emails match
-      const phoneMatch = !requestPhoneProvided || c.phoneNumber === phoneNumber; // True if request.phone is null OR phones match
-      return emailMatch && phoneMatch;
-  });
-
-  if (!exactPayloadMatchExistsInGroup) {
-      // If the exact payload doesn't exist as a row, and at least one part of it matches the group
-      // (which is true, otherwise we wouldn't be in this `else` block of `matchingContactsFromPayload.length > 0`),
-      // then we create a new secondary contact.
-      isNewInformationPresent = true; // Re-evaluating this based on the exact pair
-  }
-
-
-  if (isNewInformationPresent && (requestEmailProvided || requestPhoneProvided)) { // Ensure there's something to save
-    newSecondaryContact = await prisma.contact.create({
+  if (!TexactPayloadMatchExistsInGroup && (TrequestEmailProvided || TrequestPhoneProvided)) {
+    TnewSecondaryContact = await prisma.contact.create({
       data: {
         email: email,
         phoneNumber: phoneNumber,
-        linkedId: truePrimaryContact.id,
+        linkedId: TtruePrimaryContact.id,
         linkPrecedence: LinkPrecedence.secondary,
       },
     });
-    newSecondaryContactCreated = true;
-    console.log("Created new secondary contact:", newSecondaryContact);
+    console.log("Created new secondary contact due to new info:", TnewSecondaryContact);
+    TallAssociatedContacts.push(TnewSecondaryContact); // Add to list for response
   }
-  // --- END: LOGIC FOR CREATING NEW SECONDARY CONTACT ---
+  // --- End create new secondary contact ---
+
+  // Final gathering of all info for the response
+  const TfinalCollectedEmails = new Set<string>();
+  const TfinalCollectedPhoneNumbers = new Set<string>();
+  const TfinalSecondaryContactIds: number[] = [];
+
+  // Re-fetch ALL contacts associated with the truePrimaryContact post-merge/creation
+  const TfinalGroupMembers = await prisma.contact.findMany({
+      where: {
+          OR: [
+              {id: TtruePrimaryContact.id},
+              {linkedId: TtruePrimaryContact.id}
+          ],
+          deletedAt: null
+      },
+      orderBy: [
+          {linkPrecedence: 'asc'},
+          {createdAt: 'asc'}
+      ]
+  });
 
 
-  // Re-gather all contacts in the group if a new secondary was created
-  const finalContactsInGroup = newSecondaryContactCreated && newSecondaryContact
-    ? [...contactsForInfoCheck, newSecondaryContact] // Add the new contact to the list for response generation
-    : contactsForInfoCheck; // Use the previously fetched list
+  if (TtruePrimaryContact.email) TfinalCollectedEmails.add(TtruePrimaryContact.email);
+  if (TtruePrimaryContact.phoneNumber) TfinalCollectedPhoneNumbers.add(TtruePrimaryContact.phoneNumber);
 
-  const collectedEmails = new Set<string>();
-  const collectedPhoneNumbers = new Set<string>();
-  const collectedSecondaryContactIds: number[] = [];
-
-  if (truePrimaryContact.email) {
-    collectedEmails.add(truePrimaryContact.email);
-  }
-  if (truePrimaryContact.phoneNumber) {
-    collectedPhoneNumbers.add(truePrimaryContact.phoneNumber);
-  }
-
-  for (const contact of finalContactsInGroup) {
-    if (contact.email) {
-      collectedEmails.add(contact.email);
+  TfinalGroupMembers.forEach(contact => {
+    if (contact.email) TfinalCollectedEmails.add(contact.email);
+    if (contact.phoneNumber) TfinalCollectedPhoneNumbers.add(contact.phoneNumber);
+    if (contact.id !== TtruePrimaryContact.id) {
+      TfinalSecondaryContactIds.push(contact.id);
     }
-    if (contact.phoneNumber) {
-      collectedPhoneNumbers.add(contact.phoneNumber);
-    }
-    if (contact.id !== truePrimaryContact.id) {
-      collectedSecondaryContactIds.push(contact.id);
-    }
-  }
-  
-  // TODO LATER: Implement the actual merging logic. If `uniquePotentialPrimaries.length > 1`,
-  // all primary contacts in `uniquePotentialPrimaries` except `truePrimaryContact` (and all their secondaries)
-  // need to be updated to become secondary to `truePrimaryContact`.
+  });
 
-  const finalEmails = [
-    ...(truePrimaryContact.email ? [truePrimaryContact.email] : []),
-    ...Array.from(collectedEmails).filter(e => e !== truePrimaryContact.email)
+  const TresponseEmails = [
+    ...(TtruePrimaryContact.email ? [TtruePrimaryContact.email] : []),
+    ...Array.from(TfinalCollectedEmails).filter(e => e !== TtruePrimaryContact.email)
   ];
-  const finalPhoneNumbers = [
-    ...(truePrimaryContact.phoneNumber ? [truePrimaryContact.phoneNumber] : []),
-    ...Array.from(collectedPhoneNumbers).filter(p => p !== truePrimaryContact.phoneNumber)
+  const TresponsePhoneNumbers = [
+    ...(TtruePrimaryContact.phoneNumber ? [TtruePrimaryContact.phoneNumber] : []),
+    ...Array.from(TfinalCollectedPhoneNumbers).filter(p => p !== TtruePrimaryContact.phoneNumber)
   ];
 
   return {
     contact: {
-      primaryContatctId: truePrimaryContact.id,
-      emails: finalEmails,
-      phoneNumbers: finalPhoneNumbers,
-      secondaryContactIds: collectedSecondaryContactIds.sort((a, b) => a - b),
+      primaryContatctId: TtruePrimaryContact.id,
+      emails: TresponseEmails,
+      phoneNumbers: TresponsePhoneNumbers,
+      secondaryContactIds: TfinalSecondaryContactIds.sort((a,b) => a-b),
     },
   };
 };
