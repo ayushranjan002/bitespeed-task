@@ -1,0 +1,39 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL") // This reads the URL from your .env file
+}
+
+// Define an enum for the linkPrecedence field
+enum LinkPrecedence {
+  primary
+  secondary
+}
+
+// Define the Contact table (model)
+model Contact {
+  id             Int       @id @default(autoincrement()) // Primary key, auto-increments
+  phoneNumber    String?   // Optional string for phone number
+  email          String?   // Optional string for email
+  linkedId       Int?      // Optional: ID of another Contact this is linked to
+  linkPrecedence LinkPrecedence // "primary" or "secondary"
+  createdAt      DateTime  @default(now()) // Timestamp when created
+  updatedAt      DateTime  @updatedAt      // Timestamp when last updated
+  deletedAt      DateTime? // Optional: For soft deletes (not strictly part of core task but good)
+
+  // Defines a self-relation for linking contacts
+  // A Contact can be a primaryContact FOR other secondaryContacts
+  // A Contact can HAVE a primaryContact if it IS a secondaryContact
+  primaryContact    Contact?  @relation("LinkedContacts", fields: [linkedId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  secondaryContacts Contact[] @relation("LinkedContacts")
+
+  // Add indexes for faster lookups on these columns
+  @@index([email])
+  @@index([phoneNumber])
+}
