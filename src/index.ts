@@ -1,12 +1,11 @@
-// src/index.ts (FINAL VERSION - BEFORE ADDING /identify ROUTE HANDLER)
+// src/index.ts (Updated to use the identify controller)
 import express, { Express, Request, Response } from 'express';
-// import prisma from './db'; // We won't use prisma directly in index.ts for routing
+import { handleIdentifyRequest } from './controllers/identify.controller'; // Import the handler
 
 const app: Express = express();
 const port: number = 3000;
 
 // Middleware to parse JSON request bodies
-// This is important for your /identify endpoint later
 app.use(express.json());
 
 // A simple route for the homepage (health check)
@@ -14,11 +13,8 @@ app.get('/', (req: Request, res: Response) => {
   res.send('Bitespeed Task Server is running!');
 });
 
-// Placeholder for your /identify route - we will implement this properly soon
-// app.post('/identify', (req: Request, res: Response) => {
-//   // Logic for /identify will go into a separate controller and service
-//   res.status(501).json({ message: 'Identify endpoint not yet implemented.' });
-// });
+// Setup the /identify route to use the imported handler function
+app.post('/identify', handleIdentifyRequest);
 
 // Start the server
 app.listen(port, () => {
