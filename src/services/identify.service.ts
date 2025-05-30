@@ -162,8 +162,7 @@ export const processIdentity = async (payload: IdentifyRequestPayload): Promise<
   }
 
 
-  // --- Create new secondary contact if payload introduces new info ---
-  // This logic assumes truePrimaryContact is now correctly established.
+
   let TnewSecondaryContact: Contact | null = null;
   const TrequestEmailProvided = typeof email === 'string';
   const TrequestPhoneProvided = typeof phoneNumber === 'string';
@@ -205,9 +204,7 @@ export const processIdentity = async (payload: IdentifyRequestPayload): Promise<
     console.log("Created new secondary contact due to new info:", TnewSecondaryContact);
     TallAssociatedContacts.push(TnewSecondaryContact); // Add to list for response
   }
-  // --- End create new secondary contact ---
-
-  // Final gathering of all info for the response
+  
   const TfinalCollectedEmails = new Set<string>();
   const TfinalCollectedPhoneNumbers = new Set<string>();
   const TfinalSecondaryContactIds: number[] = [];
